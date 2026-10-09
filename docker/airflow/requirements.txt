@@ -1,0 +1,13 @@
+# Провайдер Airflow для Spark: SparkSubmitOperator
+apache-airflow-providers-apache-spark==6.3.2
+# PySpark: версия строго равна Spark в кластере (apache/spark:4.1.3); даёт бинарник spark-submit
+pyspark==4.1.3
+# Провайдер зависит от pyspark-client (тонкий клиент Spark Connect, тот же пакет pyspark).
+# Фиксируем ту же версию, чтобы он не перезаписал файлы pyspark более новой версией
+pyspark-client==4.1.3
+# Клиент ClickHouse по HTTP
+clickhouse-connect==1.10.0
+# Повторные попытки с экспоненциальной задержкой для запросов к API
+tenacity==9.1.4
+# Тесты
+pytest==9.1.1

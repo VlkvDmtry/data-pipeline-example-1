@@ -1,0 +1,28 @@
+# Список городов, для которых загружаем погоду.
+# slug    - ключ города в данных и путях S3 (латиница, без пробелов)
+# name    - человекочитаемое название
+# country - код страны ISO-2
+# lat/lon - координаты, по которым Open-Meteo ищет ближайшую точку сетки
+cities:
+  # Россия: разные климатические зоны
+  - {slug: moscow,           name: Москва,          country: RU, lat: 55.7558,  lon: 37.6173}
+  - {slug: saint_petersburg, name: Санкт-Петербург, country: RU, lat: 59.9343,  lon: 30.3351}
+  - {slug: kaliningrad,      name: Калининград,     country: RU, lat: 54.7104,  lon: 20.4522}
+  - {slug: kazan,            name: Казань,          country: RU, lat: 55.7963,  lon: 49.1088}
+  - {slug: sochi,            name: Сочи,            country: RU, lat: 43.5855,  lon: 39.7231}
+  - {slug: yekaterinburg,    name: Екатеринбург,    country: RU, lat: 56.8389,  lon: 60.6057}
+  - {slug: novosibirsk,      name: Новосибирск,     country: RU, lat: 55.0084,  lon: 82.9357}
+  - {slug: murmansk,         name: Мурманск,        country: RU, lat: 68.9585,  lon: 33.0827}
+  - {slug: yakutsk,          name: Якутск,          country: RU, lat: 62.0355,  lon: 129.6755}
+  - {slug: vladivostok,      name: Владивосток,     country: RU, lat: 43.1155,  lon: 131.8855}
+  # Мир: для сравнения
+  - {slug: london,           name: Лондон,          country: GB, lat: 51.5074,  lon: -0.1278}
+  - {slug: berlin,           name: Берлин,          country: DE, lat: 52.5200,  lon: 13.4050}
+  - {slug: madrid,           name: Мадрид,          country: ES, lat: 40.4168,  lon: -3.7038}
+  - {slug: rome,             name: Рим,             country: IT, lat: 41.9028,  lon: 12.4964}
+  - {slug: cairo,            name: Каир,            country: EG, lat: 30.0444,  lon: 31.2357}
+  - {slug: dubai,            name: Дубай,           country: AE, lat: 25.2048,  lon: 55.2708}
+  - {slug: new_york,         name: Нью-Йорк,        country: US, lat: 40.7128,  lon: -74.0060}
+  - {slug: tokyo,            name: Токио,           country: JP, lat: 35.6762,  lon: 139.6503}
+  - {slug: singapore,        name: Сингапур,        country: SG, lat: 1.3521,   lon: 103.8198}
+  - {slug: sydney,           name: Сидней,          country: AU, lat: -33.8688, lon: 151.2093}

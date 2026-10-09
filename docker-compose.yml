@@ -1,0 +1,333 @@
+# =====================================================================
+# P1: учебный data pipeline
+#   Open-Meteo API -> Python ETL -> Airflow -> S3 (MinIO) -> Spark -> ClickHouse
+# Весь стек поднимается одной командой: docker compose up -d
+# Каждый сервис работает в своём контейнере, все они в одной docker-сети,
+# поэтому обращаются друг к другу по имени сервиса (minio, clickhouse, spark-master…).
+# =====================================================================
+
+# Имя проекта: префикс для контейнеров, сетей и томов
+name: p1
+
+# ---------------------------------------------------------------------
+# Общие настройки Spark-кластера (YAML-якорь, переиспользуется ниже)
+# ---------------------------------------------------------------------
+x-spark-common: &spark-common
+  # Официальный образ Spark: Scala 2.13, Java 17, Python 3.10
+  # Версия Spark (4.1.3) ДОЛЖНА совпадать с pyspark в образе Airflow (driver)
+  image: apache/spark:4.1.3-scala2.13-java17-python3-ubuntu
+  volumes:
+    # Jar'ы для работы с S3 (hadoop-aws + AWS SDK), их скачивает сервис spark-jars-init
+    - spark_jars:/opt/extra-jars:ro
+  depends_on:
+    spark-jars-init:
+      # Ждём, пока jar'ы будут скачаны
+      condition: service_completed_successfully
+  healthcheck:
+    # Отвечает ли веб-UI процесса Spark (порт 8080 у master'а, 8081 у worker'ов).
+    # Процесс слушает адрес своего hostname, а не localhost; $$ экранирует $ от compose
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/$$(hostname)/$${SPARK_UI_PORT}"]
+    interval: 10s
+    retries: 10
+  restart: unless-stopped
+
+# ---------------------------------------------------------------------
+# Общие настройки Airflow (образ, переменные, тома)
+# ---------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  # Свой образ: apache/airflow + Java 17 + pyspark + провайдеры (см. docker/airflow/Dockerfile)
+  build:
+    context: ./docker/airflow
+  image: p1-airflow:3.3.2
+  env_file: .env
+  environment: &airflow-env
+    # LocalExecutor: задачи выполняются подпроцессами scheduler'а, без Celery/Redis
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Сколько задач Airflow выполняет одновременно (бережём память)
+    AIRFLOW__CORE__PARALLELISM: "4"
+    # Строка подключения к БД метаданных Airflow (Postgres)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    # Не загружать примеры DAG'ов из поставки Airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Новые DAG'и сразу активны (не нужно включать их в UI вручную)
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Airflow 3: задачи общаются с метаданными через Execution API в api-server
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Общий секрет JWT для api-server и scheduler
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+    # Учебный режим: встроенный SimpleAuthManager без логина, все пользователи админы
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    # Включаем HTTP health-check scheduler'а (порт 8974)
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Как часто dag-processor перечитывает папку dags (сек), удобно при разработке
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+    # Наш Python-пакет p1 (src/p1) доступен для импорта в DAG'ах и тестах
+    PYTHONPATH: /opt/airflow/src
+    # Где лежат config/cities.yaml и Spark job (пути внутри контейнера)
+    P1_CITIES_FILE: /opt/airflow/config/cities.yaml
+    P1_SPARK_JOBS_DIR: /opt/airflow/spark_jobs
+    # Подключение к S3 (MinIO): для boto3 в Python и для S3A в Spark
+    S3_ENDPOINT_URL: http://minio:9000
+    # Подключение к ClickHouse (HTTP-интерфейс)
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: "8123"
+    # Airflow Connection к Spark-кластеру, задаётся через env (формат JSON).
+    # host содержит схему spark://, так SparkSubmitHook соберёт master=spark://spark-master:7077
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077, "extra": {"deploy-mode": "client"}}'
+  volumes:
+    # Код DAG'ов: правки на хосте сразу видны в контейнере
+    - ./dags:/opt/airflow/dags
+    # Python-пакет с логикой ETL
+    - ./src:/opt/airflow/src
+    # Конфиг (список городов)
+    - ./config:/opt/airflow/config
+    # Spark job'ы (driver запускается в контейнере Airflow)
+    - ./spark/jobs:/opt/airflow/spark_jobs
+    # Тесты pytest
+    - ./tests:/opt/airflow/tests
+    # Вспомогательные shell-скрипты (запуск DAG'ов с параметрами)
+    - ./scripts:/opt/airflow/scripts:ro
+    # Логи задач в именованном томе (без проблем с правами на Windows)
+    - airflow_logs:/opt/airflow/logs
+    # Jar'ы S3A для Spark driver
+    - spark_jars:/opt/extra-jars:ro
+  depends_on: &airflow-depends-on
+    postgres:
+      condition: service_healthy
+    spark-jars-init:
+      condition: service_completed_successfully
+
+services:
+  # -------------------------------------------------------------------
+  # Postgres: база метаданных Airflow (DAG runs, состояния задач, XCom)
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:16.15
+    env_file: .env
+    volumes:
+      # Данные Postgres переживают перезапуск контейнера
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Готов ли Postgres принимать подключения
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # MinIO: S3-совместимое объектное хранилище, наш Data Lake
+  # (официальный minio/minio больше не публикуется, берём community-сборку pgsty)
+  # -------------------------------------------------------------------
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    # Запуск сервера: данные в /data, веб-консоль на порту 9001
+    command: server /data --console-address ":9001"
+    env_file: .env
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # веб-консоль MinIO
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      # Встроенный эндпоинт живости MinIO
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # Одноразовый контейнер: создаёт bucket в MinIO и завершается
+  minio-init:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    env_file: .env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Регистрируем MinIO под алиасом local
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        # Создаём bucket, если его ещё нет
+        mc mb --ignore-existing "local/$$S3_BUCKET"
+        echo "bucket $$S3_BUCKET ready"
+
+  # -------------------------------------------------------------------
+  # Одноразовый контейнер: скачивает jar'ы S3A (hadoop-aws + AWS SDK v2)
+  # в общий том spark_jars. Bundle AWS SDK весит ~640 МБ, поэтому качаем
+  # его один раз в том, а не встраиваем в каждый образ.
+  # -------------------------------------------------------------------
+  spark-jars-init:
+    image: curlimages/curl:8.16.0
+    # Запускаем под root, чтобы писать в свежесозданный том
+    user: "0:0"
+    volumes:
+      - spark_jars:/jars
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        cd /jars
+        # Версии согласованы с Hadoop 3.4.2 внутри Spark 4.1.3
+        # hadoop-aws: реализация файловой системы s3a://
+        # (-f: ошибка при HTTP 4xx/5xx, -sS: без прогресс-бара, но с текстом ошибок, -L: идти по редиректам)
+        [ -s hadoop-aws-3.4.2.jar ] || curl -fsSL --retry 5 -o hadoop-aws-3.4.2.jar \
+          https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.4.2/hadoop-aws-3.4.2.jar
+        # AWS SDK v2 bundle: клиент S3, который использует hadoop-aws.
+        # Качаем во временный файл и переименовываем только после успешной загрузки,
+        # чтобы оборванная загрузка не оставила битый jar
+        [ -s bundle-2.29.52.jar ] || { curl -fsSL --retry 5 -o bundle.tmp \
+          https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.29.52/bundle-2.29.52.jar \
+          && mv bundle.tmp bundle-2.29.52.jar; }
+        # Права на чтение для всех: Spark и Airflow работают под своими пользователями
+        chmod 644 /jars/*.jar
+        ls -lh /jars
+
+  # -------------------------------------------------------------------
+  # Spark standalone-кластер: 1 master + 2 worker'а
+  # -------------------------------------------------------------------
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    # Запуск процесса Spark Master в foreground
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8081:8080"   # UI мастера: список worker'ов и приложений
+    healthcheck:
+      # Мастер принимает подключения на порту 7077? Слушает он адрес spark-master, а не localhost
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/spark-master/7077"]
+      interval: 10s
+      retries: 10
+
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    # Worker регистрируется у мастера по адресу spark://spark-master:7077
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"       # сколько ядер worker отдаёт executor'ам
+      SPARK_WORKER_MEMORY: "1536m"  # сколько памяти worker отдаёт executor'ам
+      SPARK_UI_PORT: "8081"         # порт UI worker'а, его проверяет healthcheck
+    ports:
+      - "8082:8081"   # UI worker'а 1
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "1536m"
+      SPARK_UI_PORT: "8081"
+    ports:
+      - "8083:8081"   # UI worker'а 2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # ClickHouse: колоночная СУБД для аналитической витрины
+  # -------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.21.10
+    env_file: .env
+    environment:
+      # Разрешаем пользователю из CLICKHOUSE_USER управлять правами (SQL-driven RBAC)
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"     # HTTP-интерфейс и веб-консоль Play (/play)
+      - "19000:9000"    # нативный протокол (DBeaver, clickhouse-client); 9000 на хосте занят MinIO
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      # SQL-скрипты, которые выполняются при первом старте (создание схемы витрины)
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      # SQL-примеры аналитики, удобно запускать изнутри контейнера
+      - ./clickhouse/queries:/queries:ro
+    ulimits:
+      # ClickHouse открывает много файлов, рекомендованный лимит
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # Airflow 3
+  # -------------------------------------------------------------------
+  # Одноразовый контейнер: создаёт или мигрирует схему БД метаданных
+  airflow-init:
+    <<: *airflow-common
+    command: ["airflow", "db", "migrate"]
+    restart: "no"
+
+  # Веб-UI и REST/Execution API
+  airflow-apiserver:
+    <<: *airflow-common
+    command: ["airflow", "api-server"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Scheduler: планирует запуски и выполняет задачи (LocalExecutor).
+  # Здесь же работает Spark driver, поэтому hostname фиксирован:
+  # executor'ы на worker'ах подключаются к driver'у по имени airflow-scheduler.
+  airflow-scheduler:
+    <<: *airflow-common
+    hostname: airflow-scheduler
+    command: ["airflow", "scheduler"]
+    ports:
+      - "4040:4040"   # Spark UI работающего приложения (driver)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # DAG processor: парсит файлы из папки dags и сохраняет DAG'и в БД
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["airflow", "dag-processor"]
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+# Именованные тома: данные сохраняются между перезапусками (удаляются через down -v)
+volumes:
+  postgres_data:
+  minio_data:
+  clickhouse_data:
+  airflow_logs:
+  spark_jars:
